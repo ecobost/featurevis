@@ -453,3 +453,13 @@ class ChangeStd():
         x_std = torch.std(x.view(len(x), -1), dim=-1)
         fixed_std = x * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1))
         return fixed_std
+
+
+####################################### LOSS #############################################
+class MSE():
+    """ Compute MSE loss between x and an specified target."""
+    def __init__(self, y):
+        self.target = y
+
+    def __call__(self, x):
+        return F.mse_loss(x, self.target)
