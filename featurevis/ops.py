@@ -457,9 +457,45 @@ class ChangeStd():
 
 ####################################### LOSS #############################################
 class MSE():
-    """ Compute MSE loss between x and an specified target."""
-    def __init__(self, y):
-        self.target = y
+    """ Compute MSE loss between x and a target specified at construction.
+    
+    Arguments:
+        target (torch.tensor): Tensor to match. Broadcastable with expected input.
+    """
+    def __init__(self, target):
+        self.target = target
 
     def __call__(self, x):
         return F.mse_loss(x, self.target)
+
+class CosineSimilarity():
+    """ Computes cosine similarity between x and a target specified at construction.
+    
+    Similarity is computed over the last axes and averaged across all axes (if any).
+    
+    Arguments:
+        target (torch.Tensor): Tensor to match. Same shape as expected input.
+    """
+    def __init__(self, target):
+        self.target = target
+
+    @varargin
+    def __call__(self, x):
+        return F.cosine_similarity(x, self.target, dim=-1).mean()
+
+
+class PoissonLogLikelihood():
+    """ Computes (average) poisson log likelihood between x and a target specified at 
+    construction.
+    
+    Both target and input need to be strictly positive.
+    
+    Arguments:
+        target (torch.Tensor): Tensor to match. Broadcastable with input
+    """
+    def __init__(self, target):
+        self.target = target
+
+    @varargin
+    def __call__(self, x):
+        return -F.poisson_nll_loss(x, self.target, log_input=False)
