@@ -1,8 +1,11 @@
 import warnings
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 from scipy import signal
+from scipy.stats import multivariate_normal
 
 from featurevis.utils import varargin
 
@@ -23,7 +26,7 @@ class TotalVariation():
     @varargin
     def __call__(self, x):
         # Using the definitions from Wikipedia.
-        diffs_y = torch.abs(x[:, :, 1:] - x[:, :, -1:])
+        diffs_y = torch.abs(x[:, :, 1:] - x[:, :, :-1])
         diffs_x = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
         if self.isotropic:
             tv = torch.sqrt(diffs_y[:, :, :, :-1] ** 2 +
@@ -90,7 +93,7 @@ class Similarity():
                 numer = torch.mm(residuals, residuals.t())
                 ssr = (residuals ** 2).sum(-1)
             else:
-                mask_sum = self.mask.sum() * (flat_x.shape[-1] / len(self.mask.view(-1)))
+                mask_sum = self.mask.sum() * (flat_x.shape[-1] / len(self.mask.reshape(-1)))
                 mean = flat_x.sum(-1) / mask_sum
                 residuals = x - mean.view(len(x), *[1, ] * (x.dim() - 1))  # N x 1 x 1 x 1
                 numer = (residuals[None, :] * residuals[:, None] * self.mask).view(
@@ -102,6 +105,9 @@ class Similarity():
             sim_matrix = torch.mm(flat_x, flat_x.t()) / (torch.ger(norms, norms) + 1e-9)
         elif self.metric == 'neg_euclidean':
             sim_matrix = -torch.norm(flat_x[None, :, :] - flat_x[:, None, :], dim=-1)
+        elif self.metric == 'mse':
+            mask_sum = self.mask.sum() * (flat_x.shape[-1] / len(self.mask.reshape(-1)))
+            sim_matrix = - (torch.norm(flat_x[None, :, :] - flat_x[:, None, :], dim=-1) **2 / mask_sum)
         else:
             raise ValueError('Invalid metric name:{}'.format(self.metric))
 
@@ -166,19 +172,23 @@ class RandomCrop():
         height (int): Height of the crop.
         width (int): Width of the crop
     """
-    def __init__(self, height, width):
+    def __init__(self, height, width, n_crops=1):
         self.height = height
         self.width = width
+        self.n_crops = n_crops
 
     @varargin
     def __call__(self, x):
-        crop_y = torch.randint(0, max(0, x.shape[-2] - self.height) + 1, (1,),
-                               dtype=torch.int32).item()
-        crop_x = torch.randint(0, max(0, x.shape[-1] - self.width) + 1, (1,),
-                               dtype=torch.int32).item()
-        cropped_x = x[..., crop_y: crop_y + self.height, crop_x: crop_x + self.width]
-
-        return cropped_x
+        crop_y = torch.randint(0, max(0, x.shape[-2] - self.height) + 1, (self.n_crops,),
+                               dtype=torch.int32)
+        crop_x = torch.randint(0, max(0, x.shape[-1] - self.width) + 1, (self.n_crops,),
+                               dtype=torch.int32)
+        crops = []
+        for cy, cx in zip(crop_y, crop_x):
+            cropped_x = x[..., cy: cy + self.height, cx: cx + self.width]
+            crops.append(cropped_x)
+            
+        return torch.vstack(crops)
 
 
 class BatchedCrops():
@@ -288,6 +298,45 @@ class Identity():
     def __call__(self, x):
         return x
 
+class ThresholdLikelihood():
+    """ Threshold the latent space of a normal distribution based on radius or likelihood.
+        Arguments:
+        size (int): Length of latent vector
+        radius (float or tensor): Desired radius.
+        likelihood (float or tensor): Desired likelihood
+        fixed_radius (boolean): if True, always scale to the fixed radius regardless of original distance;
+        otherwise, only scale to the desired radius if original distance is larger than desired
+    """
+    def __init__(self, size, radius=None,likelihood=None,fixed_radius=True):
+        self.size = size
+        self.fixed_radius = fixed_radius
+        m = multivariate_normal(np.zeros(self.size),np.diag(np.ones((self.size,self.size))))
+        if radius is not None and likelihood is not None:
+            raise Exception("Only radius or likelihood can be set")
+        if radius is not None:
+            self.radius = radius
+            temp = np.zeros(self.size)
+            temp[0] = radius
+            self.likelihood = m.pdf(temp)
+        else:
+            self.likelihood = likelihood
+            def cal_radius(p,dim):
+                m = multivariate_normal(0)
+                p /= m.pdf(0)**(dim-1)
+                x = np.sqrt(-2*np.log(p*np.sqrt(2*np.pi)))
+                return x
+            self.radius = cal_radius(self.likelihood,self.size)
+            
+    @varargin
+    def __call__(self, z):
+        # Scale linearly depending on the distance from origin
+        dist = (z**2).sum(1).sqrt().unsqueeze(1).repeat(1,self.size)
+        if self.fixed_radius:  
+            scaled_z = z * (self.radius/(dist+1e-9))
+        else:            
+            desired_r = (dist > self.radius) * self.radius + (dist <= self.radius) * dist
+            scaled_z = z * (desired_r/(dist+1e-9))
+        return scaled_z
 
 ############################## GRADIENT OPERATIONS #######################################
 class ChangeNorm():
@@ -389,6 +438,17 @@ class MultiplyBy():
 
         return const * x
 
+class Slicing():
+    """
+    Slice x by one certain index.
+    """
+    def __init__(self, idx):
+        self.idx = idx
+
+    @varargin
+    def __call__(self, x, iteration=None):
+        return x[:, self.idx]
+    
 
 ########################### POST UPDATE OPERATIONS #######################################
 class GaussianBlur():
@@ -454,48 +514,60 @@ class ChangeStd():
         fixed_std = x * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1))
         return fixed_std
 
+class ChangeStats():
+    """ Change the standard deviation of input.
 
-####################################### LOSS #############################################
-class MSE():
-    """ Compute MSE loss between x and a target specified at construction.
-    
-    Arguments:
-        target (torch.tensor): Tensor to match. Broadcastable with expected input.
+        Arguments:
+        std (float or tensor): Desired std. If tensor, it should be the same length as x.
     """
-    def __init__(self, target):
-        self.target = target
-
+    def __init__(self, std, mean):
+        self.std = std
+        self.mean = mean
+        
+    @varargin
     def __call__(self, x):
-        return F.mse_loss(x, self.target)
+        x_std = torch.std(x.view(len(x), -1), dim=-1)
+        x_mean = torch.mean(x.view(len(x), -1), dim=-1)
+        fixed_im = (x - x_mean) * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
+        return fixed_im
 
-class CosineSimilarity():
-    """ Computes cosine similarity between x and a target specified at construction.
-    
-    Similarity is computed over the last axes and averaged across all axes (if any).
-    
-    Arguments:
-        target (torch.Tensor): Tensor to match. Same shape as expected input.
+class ChangeMaskStd():
+    """ Change the standard deviation of input.
+
+        Arguments:
+        std (float or tensor): Desired std. If tensor, it should be the same length as x.
     """
-    def __init__(self, target):
-        self.target = target
+    def __init__(self, std, mask, fix_bg=False, bg=0):
+        self.std = std
+        self.mask = mask
+        self.bg = bg
 
     @varargin
     def __call__(self, x):
-        return F.cosine_similarity(x, self.target, dim=-1).mean()
+        mask_mean = torch.sum(x * self.mask, (-1, -2), keepdim=True) / self.mask.sum()
+        mask_std = torch.sqrt(torch.sum(((x - mask_mean) ** 2) * self.mask, (-1, -2), keepdim=True) / self.mask.sum())
+        fixed_std = x * (self.std / (mask_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1))
+        if self.fix_bg:
+            fixed_std = fixed_std * self.mask + self.bg * (1 - self.mask)
+        return fixed_std
 
+class ChangeMaskStats():
+    """ Change the standard deviation of input.
 
-class PoissonLogLikelihood():
-    """ Computes (average) poisson log likelihood between x and a target specified at 
-    construction.
-    
-    Both target and input need to be strictly positive.
-    
-    Arguments:
-        target (torch.Tensor): Tensor to match. Broadcastable with input
+        Arguments:
+        std (float or tensor): Desired std. If tensor, it should be the same length as x.
     """
-    def __init__(self, target):
-        self.target = target
+    def __init__(self, std, mean, mask, fix_bg=False):
+        self.std = std
+        self.mask = mask
+        self.mean = mean
+        self.fix_bg = fix_bg
 
     @varargin
     def __call__(self, x):
-        return -F.poisson_nll_loss(x, self.target, log_input=False)
+        mask_mean = torch.sum(x * self.mask, (-1, -2), keepdim=True) / self.mask.sum()
+        mask_std = torch.sqrt(torch.sum(((x - mask_mean) ** 2) * self.mask, (-1, -2), keepdim=True) / self.mask.sum())
+        fixed_im = (x - mask_mean) * (self.std / (mask_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
+        if self.fix_bg:
+            fixed_im = fixed_im * self.mask + self.mean * (1 - self.mask)
+        return fixed_im
