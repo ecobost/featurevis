@@ -3,7 +3,7 @@ from setuptools import setup
 
 setup(
     name='featurevis',
-    version='0.2.1',
+    version='0.2.2',
     description='Visualize features cells are responsive to via gradient ascent',
     author='Erick Cobos',
     author_email='ecobos@bcm.edu',
