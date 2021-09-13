@@ -425,16 +425,17 @@ class MultiplyBy():
         decay_factor: Compute const every iteration as `const + decay_factor * (iteration
             - 1)`. Ignored if None.
     """
-    def __init__(self, const, decay_factor=None):
+    def __init__(self, const, decay_factor=None, low_bound=0.0):
         self.const = const
         self.decay_factor = decay_factor
+        self.low_bound = low_bound
 
     @varargin
     def __call__(self, x, iteration=None):
         if self.decay_factor is None:
             const = self.const
         else:
-            const = self.const + self.decay_factor * (iteration - 1)
+            const = max(self.low_bound, self.const + self.decay_factor * (iteration - 1))
 
         return const * x
 
@@ -526,9 +527,9 @@ class ChangeStats():
         
     @varargin
     def __call__(self, x):
-        x_std = torch.std(x.view(len(x), -1), dim=-1)
-        x_mean = torch.mean(x.view(len(x), -1), dim=-1)
-        fixed_im = (x - x_mean) * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
+        x_std = torch.std(x.view(len(x), -1), dim=-1, keepdim=True)
+        x_mean = torch.mean(x.view(len(x), -1), dim=-1, keepdim=True)
+        fixed_im = (x - x_mean[:, :, None, None]) * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
         return fixed_im
 
 class ChangeMaskStd():
