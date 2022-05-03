@@ -1,11 +1,8 @@
 import warnings
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 from scipy import signal
-from scipy.stats import multivariate_normal
 
 from featurevis.utils import varargin
 
