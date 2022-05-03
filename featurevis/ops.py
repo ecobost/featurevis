@@ -93,7 +93,7 @@ class Similarity():
                 numer = torch.mm(residuals, residuals.t())
                 ssr = (residuals ** 2).sum(-1)
             else:
-                mask_sum = self.mask.sum() * (flat_x.shape[-1] / len(self.mask.reshape(-1)))
+                mask_sum = self.mask.sum() * (flat_x.shape[-1] / len(self.mask.view(-1)))
                 mean = flat_x.sum(-1) / mask_sum
                 residuals = x - mean.view(len(x), *[1, ] * (x.dim() - 1))  # N x 1 x 1 x 1
                 numer = (residuals[None, :] * residuals[:, None] * self.mask).view(
@@ -105,9 +105,6 @@ class Similarity():
             sim_matrix = torch.mm(flat_x, flat_x.t()) / (torch.ger(norms, norms) + 1e-9)
         elif self.metric == 'neg_euclidean':
             sim_matrix = -torch.norm(flat_x[None, :, :] - flat_x[:, None, :], dim=-1)
-        elif self.metric == 'mse':
-            mask_sum = self.mask.sum() * (flat_x.shape[-1] / len(self.mask.reshape(-1)))
-            sim_matrix = - (torch.norm(flat_x[None, :, :] - flat_x[:, None, :], dim=-1) **2 / mask_sum)
         else:
             raise ValueError('Invalid metric name:{}'.format(self.metric))
 
@@ -169,12 +166,16 @@ class RandomCrop():
     """ Take a random crop of the input image.
 
     Arguments:
-        height (int): Height of the crop.
-        width (int): Width of the crop
+        c_height (int): Height of the crop.
+        c_width (int): Width of the crop
+        n_crops (int): Number of crops taken from each image in the batch
+        x (4-d tensor): A batch of images to take crops from (n x c x h x w)
+    Returns:
+        crops (5-d tensor): n x n_crops x c x c_height x c_width
     """
-    def __init__(self, height, width, n_crops=1):
-        self.height = height
-        self.width = width
+    def __init__(self, c_height, c_width, n_crops=1):
+        self.height = c_height
+        self.width = c_width
         self.n_crops = n_crops
 
     @varargin
@@ -183,12 +184,9 @@ class RandomCrop():
                                dtype=torch.int32)
         crop_x = torch.randint(0, max(0, x.shape[-1] - self.width) + 1, (self.n_crops,),
                                dtype=torch.int32)
-        crops = []
-        for cy, cx in zip(crop_y, crop_x):
-            cropped_x = x[..., cy: cy + self.height, cx: cx + self.width]
-            crops.append(cropped_x)
-            
-        return torch.vstack(crops)
+        crops = torch.stack([x[..., cy: cy + self.height, cx: cx + self.width] for cy, cx in zip(crop_y, crop_x)]).transpose(0, 1)
+        return crops
+
 
 
 class BatchedCrops():
@@ -298,46 +296,6 @@ class Identity():
     def __call__(self, x):
         return x
 
-class ThresholdLikelihood():
-    """ Threshold the latent space of a normal distribution based on radius or likelihood.
-        Arguments:
-        size (int): Length of latent vector
-        radius (float or tensor): Desired radius.
-        likelihood (float or tensor): Desired likelihood
-        fixed_radius (boolean): if True, always scale to the fixed radius regardless of original distance;
-        otherwise, only scale to the desired radius if original distance is larger than desired
-    """
-    def __init__(self, size, radius=None,likelihood=None,fixed_radius=True):
-        self.size = size
-        self.fixed_radius = fixed_radius
-        m = multivariate_normal(np.zeros(self.size),np.diag(np.ones((self.size,self.size))))
-        if radius is not None and likelihood is not None:
-            raise Exception("Only radius or likelihood can be set")
-        if radius is not None:
-            self.radius = radius
-            temp = np.zeros(self.size)
-            temp[0] = radius
-            self.likelihood = m.pdf(temp)
-        else:
-            self.likelihood = likelihood
-            def cal_radius(p,dim):
-                m = multivariate_normal(0)
-                p /= m.pdf(0)**(dim-1)
-                x = np.sqrt(-2*np.log(p*np.sqrt(2*np.pi)))
-                return x
-            self.radius = cal_radius(self.likelihood,self.size)
-            
-    @varargin
-    def __call__(self, z):
-        # Scale linearly depending on the distance from origin
-        dist = (z**2).sum(1).sqrt().unsqueeze(1).repeat(1,self.size)
-        if self.fixed_radius:  
-            scaled_z = z * (self.radius/(dist+1e-9))
-        else:            
-            desired_r = (dist > self.radius) * self.radius + (dist <= self.radius) * dist
-            scaled_z = z * (desired_r/(dist+1e-9))
-        return scaled_z
-
 ############################## GRADIENT OPERATIONS #######################################
 class ChangeNorm():
     """ Change the norm of the input.
@@ -424,18 +382,20 @@ class MultiplyBy():
         const: Number x will be multiplied by
         decay_factor: Compute const every iteration as `const + decay_factor * (iteration
             - 1)`. Ignored if None.
+        every_n_iterations: apply deca_factor every n iterations
     """
-    def __init__(self, const, decay_factor=None, low_bound=0.0):
+
+    def __init__(self, const, decay_factor=None, every_n_iterations=1):
         self.const = const
         self.decay_factor = decay_factor
-        self.low_bound = low_bound
+        self.every_n_iterations = every_n_iterations
 
     @varargin
     def __call__(self, x, iteration=None):
         if self.decay_factor is None:
             const = self.const
         else:
-            const = max(self.low_bound, self.const + self.decay_factor * (iteration - 1))
+            const = self.const + self.decay_factor * ((iteration - 1) // self.every_n_iterations)
 
         return const * x
 
@@ -448,8 +408,10 @@ class Slicing():
 
     @varargin
     def __call__(self, x, iteration=None):
-        return x[:, self.idx]
-    
+        if type(x) == 'tuple':
+            return x[self.idx]
+        else:
+            return x[:, self.idx]    
 
 ########################### POST UPDATE OPERATIONS #######################################
 class GaussianBlur():
@@ -499,76 +461,69 @@ class GaussianBlur():
 
         return final_x
 
-
-class ChangeStd():
-    """ Change the standard deviation of input.
-
-        Arguments:
-        std (float or tensor): Desired std. If tensor, it should be the same length as x.
-    """
-    def __init__(self, std):
-        self.std = std
-
-    @varargin
-    def __call__(self, x):
-        x_std = torch.std(x.view(len(x), -1), dim=-1)
-        fixed_std = x * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1))
-        return fixed_std
-
 class ChangeStats():
     """ Change the standard deviation of input.
 
         Arguments:
         std (float or tensor): Desired std. If tensor, it should be the same length as x.
+        mean (float or tensor): Desired mean. If tensor, it should be the same length as x.
     """
-    def __init__(self, std, mean):
+    def __init__(self, std, mean=None):
         self.std = std
         self.mean = mean
         
     @varargin
     def __call__(self, x):
         x_std = torch.std(x.view(len(x), -1), dim=-1, keepdim=True)
-        x_mean = torch.mean(x.view(len(x), -1), dim=-1, keepdim=True)
-        fixed_im = (x - x_mean[:, :, None, None]) * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
+        if self.mean is None:
+            fixed_im = x * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1))
+        else:
+            x_mean = torch.mean(x, (-1, -2), keepdim=True)
+            fixed_im = (x - x_mean) * (self.std / (x_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
         return fixed_im
 
-class ChangeMaskStd():
-    """ Change the standard deviation of input.
 
-        Arguments:
-        std (float or tensor): Desired std. If tensor, it should be the same length as x.
+####################################### LOSS #############################################
+class MSE():
+    """ Compute MSE loss between x and a target specified at construction.
+    
+    Arguments:
+        target (torch.tensor): Tensor to match. Broadcastable with expected input.
     """
-    def __init__(self, std, mask, fix_bg=False, bg=0):
-        self.std = std
-        self.mask = mask
-        self.bg = bg
+    def __init__(self, target):
+        self.target = target
+
+    def __call__(self, x):
+        return F.mse_loss(x, self.target)
+
+class CosineSimilarity():
+    """ Computes cosine similarity between x and a target specified at construction.
+    
+    Similarity is computed over the last axes and averaged across all axes (if any).
+    
+    Arguments:
+        target (torch.Tensor): Tensor to match. Same shape as expected input.
+    """
+    def __init__(self, target):
+        self.target = target
 
     @varargin
     def __call__(self, x):
-        mask_mean = torch.sum(x * self.mask, (-1, -2), keepdim=True) / self.mask.sum()
-        mask_std = torch.sqrt(torch.sum(((x - mask_mean) ** 2) * self.mask, (-1, -2), keepdim=True) / self.mask.sum())
-        fixed_std = x * (self.std / (mask_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1))
-        if self.fix_bg:
-            fixed_std = fixed_std * self.mask + self.bg * (1 - self.mask)
-        return fixed_std
+        return F.cosine_similarity(x, self.target, dim=-1).mean()
 
-class ChangeMaskStats():
-    """ Change the standard deviation of input.
 
-        Arguments:
-        std (float or tensor): Desired std. If tensor, it should be the same length as x.
+class PoissonLogLikelihood():
+    """ Computes (average) poisson log likelihood between x and a target specified at 
+    construction.
+    
+    Both target and input need to be strictly positive.
+    
+    Arguments:
+        target (torch.Tensor): Tensor to match. Broadcastable with input
     """
-    def __init__(self, std, mean, mask, fix_bg=False):
-        self.std = std
-        self.mask = mask
-        self.mean = mean
-        self.fix_bg = fix_bg
+    def __init__(self, target):
+        self.target = target
 
     @varargin
     def __call__(self, x):
-        mask_mean = torch.sum(x * self.mask, (-1, -2), keepdim=True) / self.mask.sum()
-        mask_std = torch.sqrt(torch.sum(((x - mask_mean) ** 2) * self.mask, (-1, -2), keepdim=True) / self.mask.sum())
-        fixed_im = (x - mask_mean) * (self.std / (mask_std + 1e-9)).view(len(x), *[1, ] * (x.dim() - 1)) + self.mean
-        if self.fix_bg:
-            fixed_im = fixed_im * self.mask + self.mean * (1 - self.mask)
-        return fixed_im
+        return -F.poisson_nll_loss(x, self.target, log_input=False)
